@@ -1,20 +1,21 @@
 """Flask 入口：页面 + 运行接口。
 
 环境变量：PGHOST / PGPORT / PGDATABASE / PGUSER / PGPASSWORD / PORT
+
+每次提交的两种隔离级别会**并行**各跑一轮，每轮在维护库里创建自己的数据库
+（维护库即 PGDATABASE，只用来 CREATE/DROP DATABASE，不承载实验表）。
+两轮的初始化和清理互相独立；重复提交也各自使用新的随机数据库名，不会交叉覆盖。
 """
 import os
-import threading
+import uuid
 
 from flask import Flask, jsonify, render_template, request
 
-from engine import run_experiment
+from engine import run_parallel_experiment
 from presets import PRESETS
 from script_parser import ScriptError, parse_script
 
 app = Flask(__name__)
-
-# 所有请求共用一个沙箱库，同一时刻只允许跑一轮实验，避免互相重置数据
-RUN_LOCK = threading.Lock()
 
 DEFAULT_TIMEOUT = 5.0
 MAX_TIMEOUT = 60.0
@@ -62,13 +63,14 @@ def run():
     except ScriptError as exc:
         return jsonify({"error": f"脚本解析失败：{exc}"}), 400
 
-    if not RUN_LOCK.acquire(blocking=False):
-        return jsonify({"error": "已有实验正在运行，请稍候（所有会话共用一个沙箱库）"}), 409
-    try:
-        rounds = run_experiment(conninfo(), init_sql, steps, check_sql, timeout_s)
-    finally:
-        RUN_LOCK.release()
-    return jsonify({"rounds": rounds, "timeout_s": timeout_s})
+    # 客户端可选传入 run_id（用于页面标识）；缺省由服务端生成。
+    # 数据库名还会附加随机后缀，所以即使两次提交使用同一 run_id 也互不影响。
+    run_id = str(body.get("run_id") or "").strip() or uuid.uuid4().hex[:12]
+
+    rounds, run_id = run_parallel_experiment(
+        conninfo(), init_sql, steps, check_sql, timeout_s, run_id=run_id)
+    return jsonify({"rounds": rounds, "timeout_s": timeout_s, "run_id": run_id,
+                    "parallel": True})
 
 
 if __name__ == "__main__":

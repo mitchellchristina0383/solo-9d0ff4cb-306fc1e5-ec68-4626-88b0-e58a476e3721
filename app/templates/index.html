@@ -39,6 +39,12 @@
              font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
   .round { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
            padding: 14px 16px; margin-bottom: 16px; }
+  .rounds-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(430px, 1fr));
+                 gap: 16px; align-items: start; }
+  .rounds-grid .round { margin-bottom: 0; }
+  .run-group { border: 1px dashed #c7ccd4; border-radius: 12px; padding: 12px 14px 16px;
+               margin-bottom: 18px; }
+  .run-group > h3 { font-size: 14px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
   .round h2 { font-size: 16px; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
   .badge { display: inline-block; border-radius: 999px; padding: 1px 10px; font-size: 12px;
            font-weight: 600; white-space: nowrap; }
@@ -55,6 +61,11 @@
            font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; }
   .sess { font-weight: 700; } .sess.A { color: #7c3aed; } .sess.B { color: #0d9488; }
   .sess.SYS { color: var(--muted); }
+  table.timeline { table-layout: fixed; }
+  table.timeline th:nth-child(1), table.timeline td:nth-child(1) { width: 58px; white-space: nowrap; }
+  table.timeline th:nth-child(2), table.timeline td:nth-child(2) { width: 38px; }
+  table.timeline th:nth-child(3), table.timeline td:nth-child(3) { width: 82px; }
+  .stepno { font-weight: 400; color: var(--muted); font-size: 11.5px; }
   .err { color: var(--bad); } .muted { color: var(--muted); }
   .mini { margin-top: 6px; } .mini th, .mini td { padding: 2px 6px; font-size: 12px; }
   h3.sub { font-size: 14px; margin: 14px 0 6px; }
@@ -67,7 +78,8 @@
 <header>
   <h1>并发写入观测台</h1>
   <p>同一组双会话交错 SQL，从相同初始数据出发，分别在 <b>READ COMMITTED</b> 与
-     <b>SERIALIZABLE</b> 下各跑一轮，对比事务结局与最终数据。改隔离级别之前，先看看数据会变成什么样。</p>
+     <b>SERIALIZABLE</b> 下<b>并行</b>各跑一轮，对比事务结局与最终数据。两轮各有独立的
+     数据库作为初始数据空间，初始化、执行与清理互不影响。</p>
 </header>
 <main>
   <section class="panel">
@@ -78,7 +90,7 @@
       <span class="hint" id="presetDesc"></span>
     </div>
 
-    <label class="block" for="initSql">初始数据 SQL（每轮开始前执行，可多条语句；两轮各自重置）</label>
+    <label class="block" for="initSql">初始数据 SQL（每轮在自己的独立数据库里执行，可多条语句；两轮互不共享表）</label>
     <textarea id="initSql" spellcheck="false"></textarea>
 
     <label class="block" for="script">交错脚本</label>
@@ -90,13 +102,13 @@
       <code>COMMIT</code> / <code>ROLLBACK</code> 收尾；脚本结束仍未提交的事务会被回滚。
     </div>
 
-    <label class="block" for="checkSql">核对查询（两轮事务都结束后，在新连接上执行）</label>
+    <label class="block" for="checkSql">核对查询（在本轮自己的数据库上、两轮事务都结束后执行）</label>
     <textarea id="checkSql" spellcheck="false"></textarea>
 
     <div class="row">
       <label for="timeout">每轮超时（秒）：</label>
       <input id="timeout" type="number" min="1" max="60" step="1" value="5">
-      <button type="button" id="run">运行（两种隔离级别各一轮）</button>
+      <button type="button" id="run">运行（两种隔离级别并行各一轮）</button>
       <span id="status"></span>
     </div>
   </section>
@@ -109,6 +121,10 @@ const $ = (id) => document.getElementById(id);
 let presets = [];
 
 const KIND_LABELS = {
+  db_create: "创建独立库",
+  db_drop: "删除独立库",
+  db_create_error: "建库失败",
+  db_drop_error: "删库失败",
   reset: "重置初始数据",
   begin: "开始事务",
   step_start: "执行",
@@ -162,10 +178,16 @@ function renderEvent(ev) {
   let label = KIND_LABELS[ev.kind] || ev.kind;
   if (ev.kind === "step_ok" && ev.after_blocked) label = "解除阻塞后完成";
   if (ev.kind === "step_error" && ev.after_blocked) label = "解除阻塞后出错";
-  tr.appendChild(el("td", null, label));
+  const tdLabel = el("td");
+  tdLabel.appendChild(el("div", null, label));
+  if (ev.step !== undefined && ev.step !== null) {
+    tdLabel.appendChild(el("div", "stepno", "步骤 " + (ev.step + 1)));
+  }
+  tr.appendChild(tdLabel);
 
   const td = el("td");
-  if (ev.sql) td.appendChild(sqlBlock(ev.sql));
+  // 步骤 SQL 已在“执行”事件里展示，完成/出错事件只展示结果，避免重复占版面。
+  if (ev.sql && ev.kind !== "step_ok") td.appendChild(sqlBlock(ev.sql));
   if (ev.kind === "step_start" && ev.mode) {
     td.appendChild(el("div", "muted", "模式：" + ev.mode));
   }
@@ -186,18 +208,33 @@ function renderRound(round) {
   const box = el("div", "round");
   const h2 = el("h2");
   h2.appendChild(el("span", null, round.isolation));
-  if (round.error) {
-    h2.appendChild(el("span", "badge bad", "本轮出错"));
+  if (!round.available) {
+    h2.appendChild(el("span", "badge bad", "本轮不可用"));
   } else if (round.timed_out) {
     h2.appendChild(el("span", "badge warn", "超时结束"));
+  } else if (round.error) {
+    h2.appendChild(el("span", "badge bad", "本轮出错"));
   } else {
     h2.appendChild(el("span", "badge ok", "正常完成"));
   }
   h2.appendChild(el("span", "muted", "耗时 " + round.duration + "s"));
   box.appendChild(h2);
+  if (round.database) {
+    box.appendChild(el("div", "muted",
+      "本轮独立数据库：" + round.database));
+  }
 
-  if (round.error) {
+  if (round.setup_failed) {
+    box.appendChild(el("div", "error-banner",
+      "本轮初始化失败，已标记为不可用（不影响另一轮）：" +
+      (round.error || "未知错误")));
+  } else if (round.error) {
     box.appendChild(el("div", "error-banner", round.error));
+  }
+  if (round.cleanup_failed) {
+    box.appendChild(el("div", "error-banner",
+      "本轮清理失败，已标记为不可用（不影响另一轮）：" +
+      (round.cleanup_error || "未知错误")));
   }
 
   const names = Object.keys(round.outcomes || {}).sort();
@@ -217,7 +254,7 @@ function renderRound(round) {
   }
 
   box.appendChild(el("h3", "sub", "执行时间线"));
-  const tl = el("table");
+  const tl = el("table", "timeline");
   const head = el("tr");
   ["时间", "会话", "事件", "SQL / 详情"].forEach((t) => head.appendChild(el("th", null, t)));
   tl.appendChild(head);
@@ -234,6 +271,9 @@ function renderRound(round) {
     } else {
       box.appendChild(el("div", "muted", "→ " + (round.check.status || "（无结果集）")));
     }
+  } else if (!round.available) {
+    box.appendChild(el("h3", "sub", "核对查询结果"));
+    box.appendChild(el("div", "muted", "本轮不可用，未执行核对查询。"));
   }
   return box;
 }
@@ -260,9 +300,20 @@ function fillPreset(i) {
 }
 
 async function run() {
-  $("run").disabled = true;
-  $("status").textContent = "运行中……";
-  $("results").textContent = "";
+  // 每次提交生成独立的 run_id；两次提交即使 run_id 相同，服务端也会为每轮
+  // 分配合新的随机数据库名，重置与清理不会交叉覆盖。
+  const runId = "r" + Date.now().toString(36) +
+    Math.random().toString(36).slice(2, 6);
+  const group = el("div", "run-group");
+  const startedAt = new Date();
+  group.appendChild(el("h3", null,
+    "本次运行 " + runId + " · 提交于 " + startedAt.toLocaleTimeString() +
+    " · 两轮并行"));
+  const grid = el("div", "rounds-grid");
+  group.appendChild(grid);
+  $("results").prepend(group);
+  $("status").textContent = "运行中……（" + runId + "）";
+
   try {
     const resp = await fetch("/api/run", {
       method: "POST",
@@ -272,18 +323,22 @@ async function run() {
         script: $("script").value,
         check_sql: $("checkSql").value,
         timeout_s: parseFloat($("timeout").value) || 5,
+        run_id: runId,
       }),
     });
     const data = await resp.json();
     if (!resp.ok) {
-      $("results").appendChild(el("div", "error-banner", data.error || ("HTTP " + resp.status)));
+      group.appendChild(el("div", "error-banner", data.error || ("HTTP " + resp.status)));
       return;
     }
-    data.rounds.forEach((r) => $("results").appendChild(renderRound(r)));
+    const wall = ((Date.now() - startedAt.getTime()) / 1000).toFixed(2);
+    group.querySelector("h3").textContent =
+      "本次运行 " + (data.run_id || runId) + " · 提交于 " +
+      startedAt.toLocaleTimeString() + " · 两轮并行 · 总墙钟 " + wall + "s";
+    data.rounds.forEach((r) => grid.appendChild(renderRound(r)));
   } catch (e) {
-    $("results").appendChild(el("div", "error-banner", String(e)));
+    group.appendChild(el("div", "error-banner", String(e)));
   } finally {
-    $("run").disabled = false;
     $("status").textContent = "";
   }
 }
